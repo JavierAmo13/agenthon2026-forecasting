@@ -73,6 +73,8 @@ jobs:
 
       - name: Official scoring gates
         run: |
+          python -m pip install --quiet qfbench2-common
+
           python scoring/scoring.py score \
             --card units/t2-F3-boj-ust-channel-2023/card.toml \
             --forecast output/forecast.parquet
