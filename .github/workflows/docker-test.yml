@@ -73,7 +73,10 @@ jobs:
 
       - name: Official scoring gates
         run: |
-          python -m pip install --quiet qfbench2-common
+          python -m pip install --quiet \
+            "qfbench2-common[data] @ git+https://github.com/Agenthon-2026/Agenthon2026-public.git@v2.4.4#subdirectory=common"
+
+          python -m pip install --quiet .
 
           python scoring/scoring.py score \
             --card units/t2-F3-boj-ust-channel-2023/card.toml \
