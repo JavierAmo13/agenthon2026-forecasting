@@ -70,9 +70,15 @@ jobs:
 
           print("PARQUET OK")
           PY
-
       - name: Official scoring gates
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Run official scoring gates
         run: |
+          python --version
+
           python -m pip install --quiet \
             "qfbench2-common[data] @ git+https://github.com/Agenthon-2026/Agenthon2026-public.git@v2.4.4#subdirectory=common"
 
