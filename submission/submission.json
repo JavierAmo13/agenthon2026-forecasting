@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.1.0",
+  "interface_version": "2.0",
+  "competition_id": "agenthon2026-forecasting-dev",
+  "team_id": "team-FILL_ME",
+  "track": "forecasting",
+  "phase": "dev",
+  "category": "api",
+  "image": {
+    "registry": "ghcr.io",
+    "repository": "FILL_ME/t2-forecasting-agent",
+    "digest": "sha256:FILL_ME"
+  },
+  "image_access": "public",
+  "models": [
+    {
+      "name": "nvidia/nemotron-3-super-120b-a12b",
+      "version": "rl-030326-fp8",
+      "revision": "rl-030326-fp8",
+      "training_cutoff": "unpublished",
+      "access": "api"
+    }
+  ],
+  "license": "MIT",
+  "descriptor_digest": "sha256:FILL_ME_RESEAL_WITH_TOOLKIT"
+}
