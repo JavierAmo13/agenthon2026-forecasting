@@ -1,0 +1,76 @@
+name: Docker smoke test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -f submission/Dockerfile \
+            -t t2-forecasting-agent:test \
+            .
+
+      - name: Check unit layout
+        run: |
+          echo "=== Unit directory ==="
+          find units/t2-F3-boj-ust-channel-2023 -maxdepth 2 -type f | sort
+
+      - name: Offline smoke test
+        run: |
+          mkdir -p output
+
+          docker run --rm \
+            --network=none \
+            --cpus=4 \
+            --memory=16g \
+            -v "$PWD/units/t2-F3-boj-ust-channel-2023:/input:ro" \
+            -v "$PWD/output:/output" \
+            t2-forecasting-agent:test \
+            forecast \
+              --panels /input/panels \
+              --text /input/text \
+              --asof 2023-07-21 \
+              --out /output/forecast.parquet
+
+      - name: Check outputs
+        run: |
+          ls -lh output
+
+          test -f output/forecast.parquet
+          test -f output/forecast_meta.json
+          test -f output/forecast_rationale.md
+
+      - name: Validate parquet
+        run: |
+          python - <<'PY'
+          import pandas as pd
+
+          df = pd.read_parquet("output/forecast.parquet")
+
+          print("Shape:", df.shape)
+          print("Columns:", list(df.columns))
+          print(df.head())
+
+          assert list(df.columns) == ["draw", "asset", "horizon", "value"]
+          assert len(df) > 0
+          assert df["value"].notna().all()
+          assert df["value"].map(
+              lambda x: x != float("inf") and x != float("-inf")
+          ).all()
+
+          print("PARQUET OK")
+          PY
+
+      - name: Official scoring gates
+        run: |
+          python scoring/scoring.py score \
+            --card units/t2-F3-boj-ust-channel-2023/card.toml \
+            --forecast output/forecast.parquet
