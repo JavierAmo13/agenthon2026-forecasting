@@ -102,8 +102,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push Docker image to GHCR
+        env:
+          GHCR_OWNER: ${{ github.repository_owner }}
         run: |
-          IMAGE="ghcr.io/${{ github.repository_owner }}/t2-forecasting-agent:dev"
+          OWNER=$(echo "$GHCR_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/t2-forecasting-agent:dev"
+
+          echo "Building: $IMAGE"
 
           docker build \
             -f submission/Dockerfile \
