@@ -26,6 +26,7 @@ jobs:
       - name: Offline smoke test
         run: |
           mkdir -p output
+          chmod 777 output
 
           docker run --rm \
             --network=none \
