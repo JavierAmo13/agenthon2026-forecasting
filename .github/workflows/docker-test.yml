@@ -51,7 +51,26 @@ jobs:
 
       - name: Validate parquet
         run: |
+          python -m pip install --quiet pandas==2.3.2 pyarrow==22.0.0
+      
           python - <<'PY'
+          import pandas as pd
+      
+          df = pd.read_parquet("output/forecast.parquet")
+      
+          print("Shape:", df.shape)
+          print("Columns:", list(df.columns))
+          print(df.head())
+      
+          assert list(df.columns) == ["draw", "asset", "horizon", "value"]
+          assert len(df) > 0
+          assert df["value"].notna().all()
+          assert df["value"].map(
+              lambda x: x != float("inf") and x != float("-inf")
+          ).all()
+      
+          print("PARQUET OK")
+          PY
           import pandas as pd
 
           df = pd.read_parquet("output/forecast.parquet")
