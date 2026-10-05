@@ -1,8 +1,9 @@
+
 """Latent market state: PCA compression of the feature block.
 
 X -> standardized -> PCA -> z_t factors (plus their lags), appended to the
-feature matrix so the model sees compressed cross-asset state, not only the
-raw columns. Fit strictly on data <= the training window to avoid leakage.
+feature matrix so the model sees compressed cross-asset state. The PCA is
+fit strictly on the data inside each training window — see model.py.
 """
 
 from __future__ import annotations
@@ -41,4 +42,5 @@ class LatentState:
         Z = X.fillna(self.med_).to_numpy(dtype=float)
         Zs = np.nan_to_num((Z - self.mu_) / self.sd_, nan=0.0)
         comp = self.pca_.transform(Zs)
-        return pd.DataFrame(comp, index=X.index, columns=[f"z{i}" for i in range(comp.shape[1])])
+        return pd.DataFrame(comp, index=X.index,
+                            columns=[f"z{i}" for i in range(comp.shape[1])])

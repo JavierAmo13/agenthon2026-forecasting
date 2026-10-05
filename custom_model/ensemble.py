@@ -1,8 +1,13 @@
+
 """Model ensembling by draw pooling.
 
 Each member contributes ``w_i * n_draws`` of its joint draws; pooled rows are
-exchangeable samples of the mixture distribution. Weights are chosen from
-walk-forward validation CRPS, never by hand.
+exchangeable samples of the mixture distribution, so every final draw is a
+complete joint scenario from ONE member — never a recombination of columns.
+
+v2: weights are shrunk toward uniform, w* = (1 - gamma) w + gamma/M, with a
+score floor before inversion — fewer all-or-nothing decisions built on a
+handful of OOF residuals (plan 3.8).
 """
 
 from __future__ import annotations
@@ -29,8 +34,12 @@ def pool_draws(member_samples: list[np.ndarray], weights: list[float],
     return out
 
 
-def inverse_score_weights(scores: list[float], floor: float = 1e-6) -> list[float]:
-    """Lower CRPS -> higher weight (inverse, normalized)."""
+def member_weights(scores: list[float], gamma: float = 0.25,
+                   floor: float = 1e-6) -> list[float]:
+    """Lower score -> higher weight (inverse), floored and shrunk to uniform."""
     s = np.clip(np.asarray(scores, dtype=float), floor, None)
     w = 1.0 / s
-    return (w / w.sum()).tolist()
+    w = w / w.sum()
+    m = len(w)
+    w = (1.0 - gamma) * w + gamma / m
+    return w.tolist()

@@ -1,21 +1,25 @@
+
 """Joint scenario generation across the (asset x horizon) grid.
 
-The composite puts 0.3 on the joint variogram: independent per-asset draws
-leave that score on the table. Dependence is a Student-t copula: correlated
-normals divided by one shared chi-square factor per draw -> tail co-movement
-(assets crash *together*, which a Gaussian copula understates). The copula's
-nu comes from the pooled excess kurtosis of standardized OOF residuals.
-
-Each task's marginal uses the empirical quantile function of its own OOF
-residuals (real asymmetry) when >=30 residuals exist, else the parametric
-Student-t/Normal inverse.
+Student-t copula on rank-estimated correlation:
+  * Residuals are aligned by origin; the common sample size is logged.
+  * R comes from Kendall tau -> sin(pi/2 * tau), the right latent parameter
+    for an elliptical copula, then shrunk toward the equicorrelation base:
+        R* = (1 - lam) R_hat + lam R_equi
+    Both are projected to nearest-PSD before Cholesky.
+  * Copula nu is a JOINT tail-dependence parameter, kept separate from the
+    marginal nu's (plan correction: nu of the copula does not change G_i).
+  * Draws: U ~ copula -> G_i^{-1}(U) per task, so marginals are preserved
+    exactly even when nu is heavy.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from scipy import stats as _st
+from scipy import stats as sstats
+
+from .probabilistic import inv_marginal
 
 
 def _nearest_psd_corr(c: np.ndarray) -> np.ndarray:
@@ -27,35 +31,44 @@ def _nearest_psd_corr(c: np.ndarray) -> np.ndarray:
     return c / np.outer(d, d)
 
 
-def _copula_nu(resid_frame: pd.DataFrame | None) -> float:
-    """Degrees of freedom for the shared copula shock, from the pooled excess
-    kurtosis of standardized OOF residuals. inf -> Gaussian copula."""
-    if resid_frame is None:
-        return np.inf
-    r = resid_frame.to_numpy(dtype=float)
-    sd = np.nanstd(r, axis=0)
-    keep = np.isfinite(sd) & (sd > 0)
-    if keep.sum() == 0:
-        return np.inf
-    z = (r[:, keep] - np.nanmean(r[:, keep], axis=0)) / sd[keep]
-    z = z[np.isfinite(z)]
-    if z.size < 200:
-        return np.inf
-    ex = float(np.mean(z ** 4)) - 3.0  # z already standardized
-    return float(np.clip(6.0 / ex + 4.0, 3.0, 30.0)) if ex > 1e-6 else np.inf
+def rank_corr(resid_frame: pd.DataFrame) -> tuple[np.ndarray, int]:
+    """Kendall-tau correlation mapped to the copula's latent Pearson-like
+    parameter. Returns (R, min common pairwise sample)."""
+    tau = resid_frame.corr(method="kendall").to_numpy(dtype=float)
+    common = int(resid_frame.notna().astype(int).T.dot(
+        resid_frame.notna().astype(int)).to_numpy().min())
+    R = np.sin(np.pi / 2.0 * np.nan_to_num(tau, nan=0.0))
+    np.fill_diagonal(R, 1.0)
+    return R, common
 
 
-def _task_quantile(model: dict, u: np.ndarray) -> np.ndarray:
-    """Copula uniforms -> standardized shocks for one task: empirical
-    quantiles when available, else the parametric Student-t/Normal inverse
-    rescaled to unit variance."""
-    emp = model.get("emp")
-    if emp is not None:
-        return np.quantile(emp, u)
-    nu = model.get("nu", np.inf)
+def shrink_corr(R: np.ndarray, lam: float) -> np.ndarray:
+    """R* = (1-lam) R + lam R_equi, R_equi = constant-correlation base with
+    the same average off-diagonal (keeps the global co-movement level)."""
+    k = R.shape[0]
+    if k <= 1:
+        return R
+    off = R[~np.eye(k, dtype=bool)]
+    equi = np.full((k, k), float(np.clip(np.nanmean(off), -0.9, 0.9)))
+    np.fill_diagonal(equi, 1.0)
+    out = (1.0 - lam) * R + lam * equi
+    return _nearest_psd_corr(out)
+
+
+def copula_uniforms(R: np.ndarray, nu: float, n_draws: int,
+                    rng: np.random.Generator) -> np.ndarray:
+    """U ~ t_nu copula (or Gaussian when nu=inf) with latent corr R."""
+    k = R.shape[0]
+    try:
+        L = np.linalg.cholesky(R)
+    except np.linalg.LinAlgError:
+        L = np.eye(k)
+    z = rng.standard_normal((n_draws, k)) @ L.T
     if np.isfinite(nu) and nu > 2.0:
-        return _st.t.ppf(u, df=nu) * np.sqrt((nu - 2.0) / nu)
-    return _st.norm.ppf(u)
+        chi = rng.chisquare(nu, size=(n_draws, 1))
+        z = z * np.sqrt(nu / chi)
+        return sstats.t.cdf(z, df=nu)
+    return sstats.norm.cdf(z)
 
 
 def joint_samples(
@@ -65,47 +78,37 @@ def joint_samples(
     resid_frame: pd.DataFrame | None,
     n_draws: int,
     seed: int = 0,
-    regime_scale: float = 1.0,
+    sigma_mult: np.ndarray | None = None,
+    lam: float = 0.35,
+    nu_copula: float | None = None,
 ) -> np.ndarray:
-    """Draw correlated samples for all tasks at once.
+    """Draw correlated samples for all tasks at once. [n_draws, n_tasks].
 
-    Parameters
-    ----------
-    tasks : [(asset, horizon), ...] in output order
-    mus : point prediction per task at the as-of
-    resid_models : fitted dict per task {mu, sigma, nu, emp}
-    resid_frame : OOF residuals, columns = task index, aligned on dates
-    Returns samples [n_draws, n_tasks]; caller reshapes to [n_draws, n_assets, n_horizons].
+    sigma_mult[i] bundles the single-point adjustments (regime numeric scale,
+    text factor) applied to task i's dispersion — each applied exactly once.
     """
     rng = np.random.default_rng(seed)
     k = len(tasks)
     mus = np.asarray(mus, dtype=float)
-    sigma = np.array([max(m.get("sigma", 1.0), 1e-8) * regime_scale for m in resid_models])
-    bias = np.array([m.get("mu", 0.0) for m in resid_models])
-    nu_c = _copula_nu(resid_frame)
+    mult = np.ones(k) if sigma_mult is None else np.asarray(sigma_mult, float)
 
     if resid_frame is not None and resid_frame.shape[1] == k:
-        corr = _nearest_psd_corr(resid_frame.corr().to_numpy(dtype=float))
-        try:
-            chol = np.linalg.cholesky(corr)
-        except np.linalg.LinAlgError:
-            chol = np.eye(k)
+        R_hat, common = rank_corr(resid_frame)
+        eff_lam = lam if common >= 20 else max(lam, 0.8)  # thin overlap -> trust the base
+        R = shrink_corr(R_hat, eff_lam)
     else:
-        chol = np.eye(k)
+        R = np.eye(k)
 
-    z = rng.standard_normal((n_draws, k)) @ chol.T
-    if np.isfinite(nu_c) and nu_c > 2.0:
-        # one shared divisor per draw: the t-copula tail co-dependence
-        chi = rng.chisquare(nu_c, size=(n_draws, 1))
-        z = z * np.sqrt((nu_c - 2.0) / chi)
-        U = np.clip(_st.t.cdf(z * np.sqrt(nu_c / (nu_c - 2.0)), df=nu_c),
-                    1e-6, 1 - 1e-6)
-    else:
-        U = np.clip(_st.norm.cdf(z), 1e-6, 1 - 1e-6)
-    zq = np.empty_like(U)
-    for i in range(k):
-        zq[:, i] = _task_quantile(resid_models[i], U[:, i])
-    return mus[None, :] + bias[None, :] + zq * sigma[None, :]
+    if nu_copula is None:
+        nus = [m.get("nu", np.inf) for m in resid_models]
+        nu_copula = float(np.nanmin(nus)) if nus else np.inf
+
+    U = copula_uniforms(R, nu_copula, n_draws, rng)
+    out = np.empty((n_draws, k), dtype=float)
+    for j, m in enumerate(resid_models):
+        q = inv_marginal(m, U[:, j])
+        out[:, j] = mus[j] + m.get("mu", 0.0) + mult[j] * (q - m.get("mu", 0.0))
+    return out
 
 
 def to_output_tensor(samples: np.ndarray, assets: list[str], horizons: list[int],

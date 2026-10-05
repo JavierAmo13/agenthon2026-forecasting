@@ -1,9 +1,24 @@
-"""Semantic outputs -> time-indexed numeric features.
 
-Aggregates per-doc LLM extractions into per-date aggregates
-(sentiment_mean/std, surprise_mean, risk_mean, event counts, per-asset
-mention intensity), then reindexes onto the feature calendar, forward-filling
-with a decay so a document influences the days after its timestamp only.
+"""Validated event extractions -> causal time-indexed features + text state.
+
+Each event carries a per-type half-life H_tipo:
+    w_j(t) = relevance_j * 0.5 ** (age_j / H_tipo)
+with relevance from effect support (explicit > inferred > insufficient), so
+an event fades at the speed of its class — not at one uniform decay.
+
+Outputs (strictly causal: an event only affects dates >= its doc's
+availability date):
+  text_n_events   distinct-event count, decayed
+  text_unc        weighted uncertainty score
+  text_surp       weighted surprise rate (only events WITH surprise_evidence)
+  text_persist    weighted persistence score
+  text_agree      direction agreement |sum w·d| / sum w·|d| over effects
+  text_state      0 = no text, 1 = nothing decisive, 2 = disagreement, 3 = aligned
+  text_dir_<A>    support-weighted direction in [-1, 1] per target asset
+  text_w_<A>      total support weight behind that direction
+
+The z_frame returned alongside is the compact text state per origin — what
+the sigma calibrator fits on, without re-calling House.
 """
 
 from __future__ import annotations
@@ -11,76 +26,124 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-NUMERIC_KEYS = ("sentiment", "relevance", "surprise", "risk_intensity")
-EVENT_TYPES = ("central_bank", "macro_release", "geopolitics", "politics")
+HALF_LIFE = {"central_bank": 21.0, "macro_release": 10.0,
+             "geopolitics": 42.0, "politics": 21.0, "other": 10.0}
+UNCERT = {"low": 0.2, "medium": 0.5, "high": 0.8}
+PERSIST = {"short": 0.2, "medium": 0.5, "long": 0.9}
+DIR = {"up": 1.0, "down": -1.0, "unclear": 0.0}
+SUPPORT_W = {"explicit": 1.0, "inferred": 0.6, "insufficient": 0.25}
 
 
-def docs_to_daily(texts, extractions: dict[str, dict]) -> pd.DataFrame:
-    rows = []
-    for doc in texts:
-        ex = extractions.get(doc.doc_id)
-        if not ex or not doc.timestamp:
+def _flatten(texts, extractions: dict[str, dict],
+             target_assets: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(events, effects): one row per event / per (event, asset) effect."""
+    ts_by_id = {d.doc_id: d.timestamp for d in texts}
+    ev_rows, fx_rows = [], []
+    for doc_id, payload in (extractions or {}).items():
+        ts = ts_by_id.get(doc_id, "")
+        if not ts:
             continue
-        row = {"date": pd.Timestamp(doc.timestamp)}
-        for k in NUMERIC_KEYS:
-            try:
-                row[k] = float(ex.get(k, np.nan))
-            except (TypeError, ValueError):
-                row[k] = np.nan
-        et = str(ex.get("event_type", "")).lower()
-        for t in EVENT_TYPES:
-            row[f"ev_{t}"] = 1.0 if et == t else 0.0
-        mentioned = [str(a).upper() for a in (ex.get("assets_mentioned") or [])]
-        row["_mentioned"] = mentioned
-        rows.append(row)
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows).set_index("date").sort_index()
-    agg = pd.DataFrame(index=df.index)
-    for k in NUMERIC_KEYS:
-        agg[f"text_{k}_mean"] = df.groupby(level=0)[k].mean()
-        agg[f"text_{k}_std"] = df.groupby(level=0)[k].std()
-    for t in EVENT_TYPES:
-        agg[f"text_{t}_count"] = df.groupby(level=0)[f"ev_{t}"].sum()
-    agg["text_doc_count"] = df.groupby(level=0).size().astype(float)
-    agg = agg.groupby(level=0).last()
-    # Per-asset mention intensity
-    mentioned_series = df["_mentioned"]
-    all_assets = sorted({a for lst in mentioned_series for a in lst})
-    for a in all_assets[:15]:
-        agg[f"text_{a}_mentions"] = mentioned_series.apply(lambda lst: float(a in lst)).groupby(level=0).sum()
-    return agg
+        date = pd.Timestamp(str(ts)[:10])
+        for ev in payload.get("events") or []:
+            if str(ev.get("novelty", "")) == "duplicate":
+                continue                    # same event told twice adds nothing
+            effects = [e for e in ev.get("effects", [])
+                       if e.get("asset") in target_assets]
+            w0 = max([SUPPORT_W.get(e.get("support", "insufficient"), 0.25)
+                      for e in effects], default=0.15)
+            ev_rows.append({
+                "date": date, "w0": w0,
+                "hl": HALF_LIFE.get(str(ev.get("event_type", "other")), 10.0),
+                "unc": UNCERT.get(str(ev.get("uncertainty", "unknown")), np.nan),
+                "pers": PERSIST.get(str(ev.get("persistence", "unknown")), np.nan),
+                "surp": 1.0 if ev.get("surprise_evidence") else 0.0,
+            })
+            for e in effects:
+                fx_rows.append({"date": date, "asset": e["asset"], "w0": w0,
+                                "hl": HALF_LIFE.get(str(ev.get("event_type", "other")), 10.0),
+                                "d": DIR.get(e.get("direction", "unclear"), 0.0),
+                                "sw": SUPPORT_W.get(e.get("support", "insufficient"), 0.25)})
+    return pd.DataFrame(ev_rows), pd.DataFrame(fx_rows)
 
 
-def align_to_calendar(daily: pd.DataFrame, index: pd.DatetimeIndex,
-                      decay_days: int = 21) -> pd.DataFrame:
-    """Reindex daily text aggregates onto the feature calendar.
-
-    Count/intensity features decay exponentially after the document date;
-    means forward-fill until superseded. All strictly causal (t uses docs
-    timestamped <= t).
-    """
-    if daily.empty:
-        return pd.DataFrame(index=index)
-    out = pd.DataFrame(index=index)
-    for col in daily.columns:
-        s = daily[col].reindex(daily.index.union(index)).sort_index()
-        s = s.ffill()
-        s = s.reindex(index)
-        out[col] = s
-    count_cols = [c for c in out.columns if c.endswith("_count") or c.endswith("_mentions")]
-    decay = np.exp(-np.arange(len(index)) / max(decay_days, 1))
-    for col in count_cols:
-        vals = out[col].fillna(0).to_numpy()
-        smoothed = np.zeros(len(index))
-        run = 0.0
-        for i, v in enumerate(vals):
-            run = run * np.exp(-1.0 / decay_days) + v
-            smoothed[i] = run
-        out[col] = smoothed
-    return out
+def _weights(df: pd.DataFrame, index: pd.DatetimeIndex) -> np.ndarray:
+    """[n_rows, n_dates] w_j(t); zero before the event's availability date."""
+    if df.empty:
+        return np.zeros((0, len(index)))
+    age = (index.to_numpy(dtype="datetime64[D]")[None, :]
+           - df["date"].to_numpy(dtype="datetime64[D]")[:, None]).astype("timedelta64[D]").astype(float)
+    hl = df["hl"].to_numpy()[:, None]
+    return np.where(age >= 0, df["w0"].to_numpy()[:, None] * 0.5 ** (age / hl), 0.0)
 
 
-def build_text_features(texts, extractions, index: pd.DatetimeIndex) -> pd.DataFrame:
-    daily = docs_to_daily(texts, extractions)
-    return align_to_calendar(daily, index)
+def build_text_features(texts, extractions, index: pd.DatetimeIndex,
+                        target_assets: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(features_on_calendar, z_frame). z_frame holds the compact state used
+    by the sigma calibrator: text_unc / text_surp / text_persist / count."""
+    events, effects = _flatten(texts, extractions, target_assets)
+    W = _weights(events, index)                    # [n_events, n_dates]
+    w = W.sum(axis=0)
+    wsafe = np.where(w > 0, w, np.nan)
+
+    def _wmean(col: str) -> np.ndarray:
+        v = events[col].to_numpy() if not events.empty else np.zeros(0)
+        ok = np.isfinite(v)
+        num = (W[ok] * np.where(ok, v, 0.0)[ok][:, None]).sum(axis=0) if ok.any() else np.zeros(len(index))
+        return num / wsafe
+
+    z = pd.DataFrame(index=index)
+    z["text_n_events"] = w
+    z["text_unc"] = _wmean("unc")
+    z["text_surp"] = _wmean("surp") if not events.empty else 0.0
+    z["text_persist"] = _wmean("pers")
+    z["text_surp"] = z["text_surp"].fillna(0.0)
+
+    # direction agreement over all target-asset effects
+    if not effects.empty:
+        We = _weights(effects, index) * effects["sw"].to_numpy()[:, None]
+        wd = (We * effects["d"].to_numpy()[:, None]).sum(axis=0)
+        wa = (We * np.abs(effects["d"].to_numpy())[:, None]).sum(axis=0)
+        z["text_agree"] = np.divide(np.abs(wd), wa, out=np.zeros(len(index)),
+                                    where=wa > 0)
+    else:
+        z["text_agree"] = 0.0
+        We = np.zeros((0, len(index)))
+
+    state = np.zeros(len(index))
+    state[w > 0] = 1
+    state[(w > 0) & (z["text_agree"] > 0) & (z["text_agree"] < 0.5)] = 2
+    state[(w > 0) & (z["text_agree"] >= 0.5)] = 3
+    z["text_state"] = state
+
+    feats = z.copy()
+    for a in target_assets:
+        if effects.empty:
+            feats[f"text_dir_{a}"] = 0.0
+            feats[f"text_w_{a}"] = 0.0
+            continue
+        sel = (effects["asset"] == a).to_numpy()
+        if not sel.any():
+            feats[f"text_dir_{a}"] = 0.0
+            feats[f"text_w_{a}"] = 0.0
+            continue
+        Wa = We[sel]
+        d_a = effects["d"].to_numpy()[sel]
+        num = (Wa * d_a[:, None]).sum(axis=0)
+        den = Wa.sum(axis=0)
+        feats[f"text_dir_{a}"] = np.divide(np.clip(num, -1e15, 1e15), den,
+                                           out=np.zeros(len(index)),
+                                           where=den > 0).clip(-1, 1)
+        feats[f"text_w_{a}"] = den
+    return feats, z[["text_unc", "text_surp", "text_persist", "text_n_events"]]
+
+
+def text_state_now(z_frame: pd.DataFrame) -> dict | None:
+    """Compact z at the last calendar date — what the sigma calibrator sees."""
+    if z_frame is None or z_frame.empty:
+        return None
+    last = z_frame.iloc[-1]
+    if not np.isfinite(last.get("text_unc", np.nan)):
+        return None
+    return {"unc": float(last["text_unc"]), "surp": float(last["text_surp"]),
+            "pers": float(last["text_persist"]),
+            "n": float(last["text_n_events"])}

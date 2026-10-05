@@ -1,8 +1,14 @@
+
 """Unit loader: enters a unit directory and returns a DataBundle.
 
 Reads card.toml (authoritative targets), forecast_spec.json (optional),
-all *.parquet panels (long format: date, asset, value, panel_id), and the
+all *.parquet panels (long format: date, asset, value, panel_id) and the
 text/ corpus (corpus_index.json + *.txt).
+
+v2: declared target assets are checked against the panels; missing ones
+land on bundle.missing_assets (explicit transfer route downstream, never
+a silent substitution). The document `timestamp` is kept as the contract
+availability date — no finer semantics are inferred.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ _ASSET_COLS = ("asset", "asset_id")
 @dataclass
 class TextDoc:
     doc_id: str
-    timestamp: str
+    timestamp: str      # availability date supplied by the contract
     path: pathlib.Path
     doc_type: str = ""
     text: str = ""
@@ -44,6 +50,7 @@ class DataBundle:
     spec: dict[str, Any] = field(default_factory=dict)
     card: dict[str, Any] = field(default_factory=dict)
     observation_periods: list[str] | None = None
+    missing_assets: list[str] = field(default_factory=list)
 
     def asset_series(self, asset: str, upto_asof: bool = True) -> pd.Series:
         """History of one asset as a datetime-indexed Series, whichever panel holds it."""
@@ -59,15 +66,17 @@ class DataBundle:
             if upto_asof:
                 sub = sub[sub["date"] <= asof]
             if not sub.empty:
-                return pd.Series(sub["value"].to_numpy(dtype=float), index=pd.DatetimeIndex(sub["date"]))
+                return pd.Series(sub["value"].to_numpy(dtype=float),
+                                 index=pd.DatetimeIndex(sub["date"]))
         raise KeyError(f"asset {asset!r} not present in any panel")
+
+    def available_assets(self) -> list[str]:
+        return [a for a in self.target_assets if a not in self.missing_assets]
 
 
 def _load_spec(unit_dir: pathlib.Path) -> dict[str, Any]:
     p = unit_dir / "forecast_spec.json"
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {}
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
 
 
 def _load_card(unit_dir: pathlib.Path) -> dict[str, Any]:
@@ -100,15 +109,10 @@ def _load_texts(unit_dir: pathlib.Path) -> list[TextDoc]:
         idx = json.loads(index_path.read_text(encoding="utf-8"))
         for d in idx.get("documents", []):
             f = text_dir / d.get("file", "")
-            docs.append(
-                TextDoc(
-                    doc_id=d.get("doc_id", f.stem),
-                    timestamp=d.get("timestamp", ""),
-                    path=f,
-                    doc_type=d.get("doc_type", ""),
-                    text=f.read_text(encoding="utf-8", errors="replace") if f.exists() else "",
-                )
-            )
+            docs.append(TextDoc(
+                doc_id=d.get("doc_id", f.stem), timestamp=d.get("timestamp", ""),
+                path=f, doc_type=d.get("doc_type", ""),
+                text=f.read_text(encoding="utf-8", errors="replace") if f.exists() else ""))
         return docs
     for f in sorted(text_dir.glob("*.txt")):
         docs.append(TextDoc(doc_id=f.stem, timestamp="", path=f,
@@ -116,24 +120,29 @@ def _load_texts(unit_dir: pathlib.Path) -> list[TextDoc]:
     return docs
 
 
-def _resolve_asof(unit_dir: pathlib.Path, spec: dict, card: dict, texts: list[TextDoc]) -> str:
+def _resolve_asof(unit_dir: pathlib.Path, spec: dict, card: dict) -> str:
     idx = unit_dir / "text" / "corpus_index.json"
     if idx.exists():
         data = json.loads(idx.read_text(encoding="utf-8"))
         if data.get("asof"):
             return str(data["asof"])[:10]
-    for cand in (
-        card.get("provenance", {}).get("data_cutoff"),
-        card.get("text", {}).get("cutoff"),
-        spec.get("asof"),
-    ):
+    for cand in (card.get("provenance", {}).get("data_cutoff"),
+                 card.get("text", {}).get("cutoff"), spec.get("asof")):
         if cand:
             return str(cand)[:10]
-    # Fallback: max panel end_date in spec, else max panel date.
     ends = [p.get("end_date") for p in spec.get("panels", []) if p.get("end_date")]
     if ends:
         return max(ends)[:10]
     raise ValueError(f"cannot resolve as-of date for {unit_dir.name}")
+
+
+def _present_assets(panels: dict[str, pd.DataFrame]) -> set[str]:
+    out: set[str] = set()
+    for df in panels.values():
+        col = next((c for c in _ASSET_COLS if c in df.columns), None)
+        if col is not None:
+            out.update(df[col].astype(str).unique())
+    return out
 
 
 def load_unit(unit_dir: str | pathlib.Path) -> DataBundle:
@@ -150,23 +159,20 @@ def load_unit(unit_dir: str | pathlib.Path) -> DataBundle:
     if not assets or not horizons:
         raise ValueError(f"{unit_dir.name}: card/spec lacks target assets/horizons")
 
-    n_draws_min = (
-        spec.get("n_draws_min")
-        or card.get("scoring", {}).get("params", {}).get("n_draws_min")
-        or 200
-    )
+    n_draws_min = (spec.get("n_draws_min")
+                   or card.get("scoring", {}).get("params", {}).get("n_draws_min")
+                   or 200)
     panel_specs = {p.get("panel_id", k): p for k, p in
                    ((p.get("panel_id"), p) for p in spec.get("panels", []))} if spec.get("panels") else {}
-    # card.toml [panels] section as an alternative source of panel metadata
     for pid, pmeta in (card.get("panels") or {}).items():
         if isinstance(pmeta, dict):
             panel_specs.setdefault(pid, pmeta)
 
-    return DataBundle(
+    bundle = DataBundle(
         unit_dir=unit_dir,
         card_id=card.get("task", {}).get("id", spec.get("card_id", unit_dir.name)),
         card_family=spec.get("card_family") or card.get("metadata", {}).get("category", ""),
-        asof=_resolve_asof(unit_dir, spec, card, texts),
+        asof=_resolve_asof(unit_dir, spec, card),
         target_assets=assets,
         horizons=horizons,
         target_type=tgt.get("target_type", spec_tgt.get("target_type", "level")),
@@ -180,3 +186,8 @@ def load_unit(unit_dir: str | pathlib.Path) -> DataBundle:
         card=card,
         observation_periods=spec_tgt.get("observation_periods"),
     )
+    # Explicit transfer route: assets declared but absent from every panel are
+    # flagged; downstream they get the statistical fallback, not a proxy made up on the fly.
+    present = _present_assets(panels)
+    bundle.missing_assets = [a for a in assets if a not in present]
+    return bundle

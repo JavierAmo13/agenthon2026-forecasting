@@ -1,5 +1,3 @@
-"""Custom generic forecasting pipeline for Agenthon 2026 Track 2.
 
-# One pipeline handles all units: loader -> features -> targets -> dataset ->
-# model -> probabilistic -> joint -> forecast.parquet
-# """
+"""custom_model v2: probabilistic forecasting verb for track-2 units."""
+__version__ = "2.0.0"

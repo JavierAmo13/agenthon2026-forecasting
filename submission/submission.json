@@ -2,14 +2,14 @@
   "schema_version": "1.1.0",
   "interface_version": "2.0",
   "competition_id": "agenthon2026-forecasting-dev",
-  "team_id": "team-FILL_ME",
+  "team_id": "team-d5ce55a261bad4380d77dcd224c51afe",
   "track": "forecasting",
   "phase": "dev",
   "category": "api",
   "image": {
     "registry": "ghcr.io",
-    "repository": "FILL_ME/t2-forecasting-agent",
-    "digest": "sha256:FILL_ME"
+    "repository": "javieramo13/t2-forecasting-agent",
+    "digest": "sha256:2b04f14a0be05bbbdef378343929decd763493bd01fea92644699cbe796ca29d"
   },
   "image_access": "public",
   "models": [
