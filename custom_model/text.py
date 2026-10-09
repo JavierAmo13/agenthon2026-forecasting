@@ -2,7 +2,7 @@
 """House model client + text->adjustment extraction.
 
 One call per unit (the budget allows 25; a single well-built call beats a
-chatty loop — the official reasoning baseline makes one call and never
+chatty loop - the official reasoning baseline makes one call and never
 retries). The model reads dated documents, returns bounded JSON, and the
 caller applies the adjustments with hard clamps; everything is logged to
 forecast_meta.json and forecast_rationale.md so a reviewer can audit which
@@ -58,7 +58,7 @@ def available() -> bool:
 
 def _house_reply(endpoint: str, token: str, body: bytes):
     """The organizer route: the audited receipt proxy, reached exactly the
-    way baselines/reasoning_agent.py reaches it — plain HTTP to the proxy,
+    way baselines/reasoning_agent.py reaches it - plain HTTP to the proxy,
     absolute-URI request target, Bearer for the model and Basic for the
     proxy. The URL path is always /v1/chat/completions on the endpoint's
     netloc (the endpoint itself may or may not carry /v1)."""
@@ -158,6 +158,10 @@ def build_prompt(bundle, docs, ctx: dict) -> str:
         "- 'skew': in [-0.5, 0.5]; >0 widens the up side, <0 the down side.",
         "  Use it when the documents describe an asymmetric branch (peg,",
         "  vote, binary decision).",
+        "- 'per_horizon': optional dict keyed by horizon ('63': {...}) with",
+        "  the same drift_bp/vol_scale/skew fields. Use it when a dated",
+        "  event lands inside one horizon but not another - the base fields",
+        "  then describe the longest horizon only.",
         "- 'scenarios': optional, at most 3 named branches with probabilities",
         "  summing <= 1 and per-asset shifts in units of sd_long_h. Leave",
         "  empty when one regime is clearly dominant.",
@@ -168,7 +172,9 @@ def build_prompt(bundle, docs, ctx: dict) -> str:
         "",
         "Reply with JSON only:",
         '{"assets": {"<id>": {"drift_bp": <f>, "vol_scale": <f>,',
-        '   "skew": <f>, "why": "doc_id: ..."}},',
+        '   "skew": <f>, "why": "doc_id: ...",',
+        '   "per_horizon": {"<h>": {"drift_bp": <f>, "vol_scale": <f>,',
+        '   "skew": <f>}}}},',
         ' "scenarios": [{"p": <f>, "shifts_sd": {"<id>": <f>},',
         '   "vol": <f>, "label": "..."}],',
         ' "anchors": {"<id>": {"level_est": <f|null>, "daily_vol_pct": <f|null>}}}',

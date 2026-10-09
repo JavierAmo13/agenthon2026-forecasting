@@ -4,7 +4,7 @@
 The F2/F3 transfer cards ship the target's early history (e.g. BRL
 1995-2003) and a single observation at the as-of date, with the middle
 years withheld. The anchor is therefore correct (the as-of row); what the
-early window cannot give is TODAY's volatility regime — a 2003-vintage
+early window cannot give is TODAY's volatility regime - a 2003-vintage
 sigma badly under-covers a 2013 taper tantrum.
 
 Fix: rescale the transfer asset's early-window sigma by how much the
@@ -23,7 +23,7 @@ from . import steps as st
 
 
 def detect_transfer(bundle, series: pd.Series, gap_days: int = 900) -> bool:
-    """True when the asset's last-obs gap before the as-of row is huge —
+    """True when the asset's last-obs gap before the as-of row is huge -
     the withheld-middle signature of a transfer card."""
     if series is None or len(series) < 3:
         return False
@@ -85,7 +85,7 @@ def basket_sigma_now(bundle, exclude: set[str]) -> float:
 
 def stressed_sigma_floor(bundle, series: pd.Series) -> float:
     """75th percentile of the EWMA sigma path over the asset's OWN early
-    window — the dispersion it showed when it was stressed, not the calm
+    window - the dispersion it showed when it was stressed, not the calm
     reading at the window's end. The early windows contain the asset's
     real crises (BRL 1999 deval, INR 1997-98, CNY regime changes); a
     transfer card asks for the NEW regime, so the calm-endpoint sigma

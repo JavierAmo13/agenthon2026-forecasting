@@ -1,5 +1,5 @@
 
-"""End-to-end test with a synthetic House reply — exercises the full
+"""End-to-end test with a synthetic House reply - exercises the full
 text overlay path (prompt build -> parse -> apply -> deliverables)."""
 import json
 import pathlib
@@ -46,7 +46,7 @@ def test_overlay(tmp_path=None):
     assert stats["text"]["applied"] is True
     d = stats["text"]["ledger"]
     assert d["UST_2Y"]["applied"]
-    print("overlay ok — UST_2Y ledger:", d["UST_2Y"])
+    print("overlay ok - UST_2Y ledger:", d["UST_2Y"])
     print("scenarios:", d.get("_scenarios"))
 
 

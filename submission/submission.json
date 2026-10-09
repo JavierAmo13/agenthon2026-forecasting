@@ -9,7 +9,7 @@
   "image": {
     "registry": "ghcr.io",
     "repository": "javieramo13/t2-forecasting-agent",
-    "digest": "sha256:77098d4a675e75aae9c541719306e1ac14a93c1e3cdc5028538996e80735535b"
+    "digest": "sha256:6ddac339c876cf6856c4d7accfffe480d07095e74197563923e576e0b804cb9b"
   },
   "image_access": "public",
   "models": [

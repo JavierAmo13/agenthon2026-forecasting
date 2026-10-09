@@ -1,5 +1,5 @@
 
-"""Internal pre-write sanity check — cheap mirror of the shipped gates.
+"""Internal pre-write sanity check - cheap mirror of the shipped gates.
 
 Runs before the atomic write so a malformed artifact never lands on disk:
 rows == n_draws x n_cells, columns exactly (draw, asset, horizon, value),

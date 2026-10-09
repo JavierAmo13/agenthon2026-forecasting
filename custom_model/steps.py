@@ -34,7 +34,7 @@ def gap_mask(index: pd.DatetimeIndex, window: int = 300) -> pd.Series:
 
     M0 S3.3: hole = interval > max(10 x median spacing of the trailing
     window, 5 days). Median computed over the trailing `window` rows'
-    intervals — on a transfer card the early-window median, so the decade
+    intervals - on a transfer card the early-window median, so the decade
     bridge is dropped while old observations survive.
     """
     if len(index) < 3:
@@ -103,7 +103,7 @@ def resolve_steps(bundle) -> dict[tuple[str, int], int]:
     Daily panels: the declared key IS the business-day count.
     Monthly cards with observation_periods: months from the anchor
     observation's month to the named month (named-month rule). Without a
-    mapping, month count inferred as round(h/21) is the honest fallback —
+    mapping, month count inferred as round(h/21) is the honest fallback -
     it is what a participant can compute without sealed target dates, and
     beats taking 140 as months by a factor of ~7.
     """

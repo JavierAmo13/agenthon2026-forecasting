@@ -4,13 +4,13 @@
 Three knobs, per the solver playbook, each applied with hard clamps and
 each logged line-by-line for the rationale:
 
-  * drift   — center shift, in bp of |anchor| (level/yield) or absolute
+  * drift   - center shift, in bp of |anchor| (level/yield) or absolute
               return bp (log_return); clamped to +-1.5 x cell sd so a stray
               model number cannot crater the card
-  * vol     — dispersion multiplier about the median, [0.7, 1.6]
-  * skew    — one-sided stretch in [-0.5, 0.5]: the cheap stand-in for a
+  * vol     - dispersion multiplier about the median, [0.7, 1.6]
+  * skew    - one-sided stretch in [-0.5, 0.5]: the cheap stand-in for a
               two-branch scenario mixture (widens one tail only)
-  * scenarios — optional labelled branches: a per-draw assignment turns the
+  * scenarios - optional labelled branches: a per-draw assignment turns the
               draws into a real mixture distribution over the joint grid
 """
 
@@ -52,12 +52,25 @@ def apply_adjustments(draws: np.ndarray, assets: list[str], horizons: list[int],
             continue
         anchor = abs(anchors.get(a, 0.0)) or 1.0
         scale = 1.0 if target_type == "log_return" else anchor
-        shift = scale * _finite(spec.get("drift_bp")) / 1e4
-        vol = min(max(_finite(spec.get("vol_scale"), 1.0), vol_clamp[0]),
-                  vol_clamp[1])
-        skew = min(max(_finite(spec.get("skew")), -SKEW_CAP), SKEW_CAP)
+        base_shift = scale * _finite(spec.get("drift_bp")) / 1e4
+        base_vol = min(max(_finite(spec.get("vol_scale"), 1.0), vol_clamp[0]),
+                       vol_clamp[1])
+        base_skew = min(max(_finite(spec.get("skew")), -SKEW_CAP), SKEW_CAP)
+        per_h = spec.get("per_horizon")
+        per_h = per_h if isinstance(per_h, dict) else {}
         notes = []
         for hi, h in enumerate(horizons):
+            # multi-horizon cards carry dated events: a shock that lands at
+            # h=63 is not the h=189 shock. The model may give a per-horizon
+            # override {"per_horizon": {"63": {...}}} - same clamps apply.
+            ov = per_h.get(str(h), per_h.get(h))
+            ov = ov if isinstance(ov, dict) else {}
+            shift = (scale * _finite(ov.get("drift_bp")) / 1e4
+                     if ov else base_shift)
+            vol = min(max(_finite(ov.get("vol_scale"), base_vol) if ov
+                          else base_vol, vol_clamp[0]), vol_clamp[1])
+            skew = min(max(_finite(ov.get("skew"), base_skew) if ov
+                           else base_skew, -SKEW_CAP), SKEW_CAP)
             sd = float(cell_sd.get((a, h), 0.0)) or 1.0
             cap = drift_cap * sd
             s = max(-cap, min(cap, shift))
@@ -69,8 +82,11 @@ def apply_adjustments(draws: np.ndarray, assets: list[str], horizons: list[int],
                 dev = np.where(pos, dev * (1 + skew), dev * (1 - skew))
                 notes.append(f"h{h}: skew {skew:+.2f}")
             draws[:, ai, hi] = med + dev * vol + s
+            if ov:
+                notes.append(f"h{h}: per-horizon override")
         ledger[a] = {"applied": True, "drift_bp": _finite(spec.get("drift_bp")),
-                     "vol_scale": vol, "skew": skew,
+                     "vol_scale": base_vol, "skew": base_skew,
+                     "per_horizon": bool(per_h),
                      "why": str(spec.get("why", ""))[:300],
                      "notes": notes}
 

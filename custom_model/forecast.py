@@ -1,5 +1,5 @@
 
-"""forecast verb — the Track-2 pipeline.
+"""forecast verb - the Track-2 pipeline.
 
     forecast --panels /input/panels/ --text /input/text/ \
              --asof YYYY-MM-DD --out /output/forecast.parquet
@@ -35,9 +35,9 @@ from .engine import AssetModel, _build_asset_model, simulate
 from .calibrate import calibrate, apply_corrections
 from . import deliver, text, transfer, apply, selfcheck
 
-DEFAULT_DRAWS = 3000
+DEFAULT_DRAWS = 6000
 MAX_DRAWS = 20_000
-# The stage clock (43,200 s) is shared across ~104 units — ~400 s each once
+# The stage clock (43,200 s) is shared across ~104 units - ~400 s each once
 # the cold pull is billed. The internal ceiling stays well under that so one
 # pathological card cannot starve the rest of the roster.
 TIME_BUDGET = 300.0
@@ -57,7 +57,7 @@ def _unit_seed(card_id: str) -> int:
 
 def _card_minimal_bundle(unit_dir: pathlib.Path, asof: str):
     """Last-resort bundle: parse card.toml only. If panels/spec/text are
-    unreadable we can still honour the contract with a wide gaussian floor —
+    unreadable we can still honour the contract with a wide gaussian floor -
     a failed load must not become an empty /output."""
     import tomllib
     from .load import DataBundle
@@ -92,7 +92,7 @@ def _card_minimal_bundle(unit_dir: pathlib.Path, asof: str):
 
 
 def _gaussian_floor(bundle, n_draws: int, seed: int) -> np.ndarray:
-    """M0-faithful correlated Gaussian walk — the guaranteed floor."""
+    """M0-faithful correlated Gaussian walk - the guaranteed floor."""
     rng = np.random.default_rng(seed ^ 0xF00D)
     assets, horizons = bundle.target_assets, bundle.horizons
     steps_map = st.resolve_steps(bundle)
@@ -160,12 +160,12 @@ def _transfer_adjust(bundle, models: list[AssetModel], stats: dict) -> None:
         ratio = transfer.basket_regime_ratio(
             bundle, end, exclude=set(bundle.target_assets))
         # EM FX is structurally more volatile than the G10 basket, and the
-        # withheld years are precisely the ones that carry today's regime —
+        # withheld years are precisely the ones that carry today's regime -
         # never let a calm-basket ratio SHRINK the early-window sigma. And
         # the EWMA endpoint of a window that ends in a calm patch under-
         # reads the regime: use the asset's own stressed history as floor.
         # EM FX is structurally more volatile than the G10 basket, and the
-        # withheld years are precisely the ones that carry today's regime —
+        # withheld years are precisely the ones that carry today's regime -
         # never let a calm-basket ratio SHRINK the early-window sigma. The
         # per-draw scale is the asset's own EWMA path (a regime library):
         # a scale mixture over its observed history, lifted by the basket's
@@ -248,7 +248,9 @@ def run_bundle(bundle, *, n_draws: int, seed: int,
         return _gaussian_floor(bundle, n_draws, seed), {**stats,
                                                       "fallback": True,
                                                       "reason": "no usable series"}
-    tail_boost = 1.4 if str(bundle.family).endswith("F4") else 0.8
+    tail_boost = float(os.environ.get(
+        "F4TB", "2.2")) if str(bundle.family).endswith("F4") else float(
+        os.environ.get("TB", "0.8"))
     samples = simulate(models, step_counts, bundle.horizons, n_draws, seed,
                        tail_boost=tail_boost)
     stats["engine"]["sigma_now"] = {m.asset: round(m.sigma_now, 6) for m in models}
@@ -318,7 +320,7 @@ def run_bundle(bundle, *, n_draws: int, seed: int,
 
     # family prior: a card self-declared F4 ("tail/shock from text") tells
     # the task itself that an extreme move sits in the horizon. When no
-    # text read refined it, widen honestly and lean the downside —
+    # text read refined it, widen honestly and lean the downside -
     # documented in the rationale as the family-level prior, not a guess.
     if family_prior and not stats["text"].get("applied"):
         fam = str(bundle.family)
@@ -362,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--no-text", action="store_true")
     ap.add_argument("--time-budget", type=float, default=TIME_BUDGET)
-    a = ap.parse_args(argv)
+    a, _unknown = ap.parse_known_args(argv)
 
     unit_dir = _find_unit(a.panels)
     if a.card is not None and pathlib.Path(a.card).is_file():

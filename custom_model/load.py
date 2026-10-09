@@ -7,7 +7,7 @@ gate g2 use), then corpus_index.json `asof`, then card [forecast].asof /
 [provenance].data_cutoff. Panels are truncated at the as-of on read.
 
 Assets are looked up across ALL shipped panels (sorted order). A target asset
-absent from every panel lands on `missing_assets` — the transfer route
+absent from every panel lands on `missing_assets` - the transfer route
 (engine + text) handles it explicitly rather than fabricating a proxy.
 """
 
@@ -57,7 +57,7 @@ class DataBundle:
 
     def series(self, asset: str, upto_asof: bool = True) -> pd.Series | None:
         """Datetime-indexed value series of an asset, first panel (sorted
-        order) that carries it — M0's own selection rule (S3.1)."""
+        order) that carries it - M0's own selection rule (S3.1)."""
         cut = pd.Timestamp(self.asof) if upto_asof else None
         for stem in sorted(self.panels):
             df = self.panels[stem]

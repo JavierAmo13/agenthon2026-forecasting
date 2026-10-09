@@ -11,6 +11,7 @@ import pathlib
 import subprocess
 import sys
 
+SRC = pathlib.Path(__file__).resolve().parents[2]
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
@@ -33,7 +34,7 @@ def run_unit(unit: pathlib.Path, out_dir: pathlib.Path) -> dict:
     unit, out_dir = pathlib.Path(unit), pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     env = dict(**__import__("os").environ)
-    env["PYTHONPATH"] = str(ROOT / "v3_src") + ";" + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(SRC) + ";" + env.get("PYTHONPATH", "")
     import tomllib
     card = tomllib.loads((unit / "card.toml").read_text(encoding="utf-8"))
     asof = str(card.get("forecast", {}).get("asof")
@@ -63,5 +64,5 @@ if __name__ == "__main__":
                    ROOT / "t2_repo/units/t2-F4-covid-mkt-2020"])
     for u in units:
         print("=" * 60, "\n", u.name)
-        res = run_unit(u, ROOT / "v3_src/_runs" / u.name)
+        res = run_unit(u, SRC / "_runs" / u.name)
         print(json.dumps(res, indent=2)[:1200])

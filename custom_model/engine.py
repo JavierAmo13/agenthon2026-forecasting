@@ -1,5 +1,5 @@
 
-"""Joint innovations engine — the forecast backbone.
+"""Joint innovations engine - the forecast backbone.
 
 Per the organizers' solver playbook, the winning recipe on the internal
 blind-solve evaluation was a scenario-weighted mixture over a
@@ -11,11 +11,11 @@ bootstrap/regime engine. This implements exactly that backbone:
     while dispersion is re-anchored to the current regime sigma_now.
   * Stationary block bootstrap on ONE shared date index: the same resampled
     calendar day drives every asset, so empirical cross-asset and cross-
-    horizon dependence — including joint tail co-movement — is preserved
+    horizon dependence - including joint tail co-movement - is preserved
     without fitting a copula.
   * Recency-weighted block starts (60% recent-window + 40% full-history
     blend), plus an optional crisis-day boost that concentrates starts on
-    dates where max|z| was extreme — fattening joint tails when the text or
+    dates where max|z| was extreme - fattening joint tails when the text or
     regime says stress.
   * Paths accumulate per asset; every cell reads off the same path, so
     cross-horizon covariance min(s_i, s_j)*Sigma is reproduced by
@@ -57,11 +57,16 @@ class AssetModel:
     cadence: str            # 'daily' | 'monthly'
     notes: dict = field(default_factory=dict)
     sigma_pool: np.ndarray | None = None
+    phi: float = 0.0
     # When set (transfer assets), each draw samples its per-step sigma
     # from the asset's own historical vol-regime distribution, biased to
     # the stressed regime. This is a scale mixture over the asset's own
     # history: honest dispersion for an asset whose recent regime is
     # withheld, rather than a point estimate of a calm endpoint.
+    # phi: per-step mean-reversion pull toward the anchor, estimated only
+    # on `level` targets where the AR regression is significant - a pure
+    # random walk over-scales long-horizon dispersion (~sqrt(h)) on series
+    # that actually revert.
 
 
 def _build_asset_model(asset: str, s: pd.Series, bundle,
@@ -90,10 +95,50 @@ def _build_asset_model(asset: str, s: pd.Series, bundle,
         mu = drift_shrink * float(x.mean())
         mu = float(np.clip(mu, -0.8 * sigma_full, 0.8 * sigma_full))
     anchor = 0.0 if bundle.target_type == "log_return" else float(s.iloc[-1])
-    return AssetModel(asset, anchor, z, sigma_now, mu, cad,
-                      {"sigma_now": sigma_now, "sigma_full": sigma_full,
-                       "n_steps": len(x),
-                       "target_type": bundle.target_type})
+    model = AssetModel(asset, anchor, z, sigma_now, mu, cad,
+                       {"sigma_now": sigma_now, "sigma_full": sigma_full,
+                        "n_steps": len(x),
+                        "target_type": bundle.target_type})
+    phi = _estimate_pull(s, x, bundle.target_type)
+    if phi > 0:
+        model.phi = phi
+        model.notes["phi"] = round(phi, 5)
+    return model
+
+
+def _estimate_pull(s: pd.Series, x: pd.Series, target_type: str) -> float:
+    """Per-step AR pull phi in x_t = c - phi*(level_{t-1} - median) + e.
+
+    Engages only when the evidence is real: level target, >=250 aligned
+    obs, phi_hat in (0.003, 0.12) and its t-stat above 2.2. The applied
+    value is shrunk to half the estimate and capped at 0.05/step (a ~14
+    observation half-life) - enough to stop the sqrt(h) over-widening on
+    long horizons, never enough to pin the path to the anchor.
+    """
+    if target_type != "level" or len(s) < 260:
+        return 0.0
+    if os.environ.get("MR", "1") == "0":
+        return 0.0
+    lv = s.to_numpy(dtype=float)
+    med = np.nanmedian(lv)
+    dev = lv[:-1] - med
+    xn = np.diff(lv)
+    msk = np.isfinite(dev) & np.isfinite(xn)
+    dev, xn = dev[msk], xn[msk]
+    n = len(xn)
+    if n < 250 or float(np.std(dev)) <= 0:
+        return 0.0
+    dvar = float(np.var(dev))
+    b = float(np.cov(xn, dev)[0, 1] / dvar)
+    phi_hat = -b
+    if not (0.003 < phi_hat < 0.12):
+        return 0.0
+    resid = xn - xn.mean() - b * dev
+    se = float(np.sqrt((resid ** 2).sum() / max(n - 2, 1))
+               / (np.sqrt(dvar) * np.sqrt(n)))
+    if se <= 0 or phi_hat / se < 2.2:
+        return 0.0
+    return float(min(0.5 * phi_hat, 0.05))
 
 
 def median_or_zero(x: pd.Series) -> float:
@@ -110,7 +155,11 @@ def _start_weights(common_index: pd.DatetimeIndex, zmax: pd.Series,
     rec = 0.5 ** (age / hl)
     w = RECENCY_MIX * rec / rec.sum() + (1 - RECENCY_MIX) / T
     if tail_boost > 0:
-        crisis = (zmax > 2.5).to_numpy(dtype=float)
+        # data-driven crisis marker: fixed 2.5 misses series whose z never
+        # gets that extreme (short panels, compressed units); q90 keeps the
+        # boost meaningful on every history length.
+        thr = max(2.5, float(np.quantile(zmax.to_numpy(), 0.90)))
+        crisis = (zmax > thr).to_numpy(dtype=float)
         w = w * (1.0 + tail_boost * crisis)
         w = w / w.sum()
     return w
@@ -118,7 +167,7 @@ def _start_weights(common_index: pd.DatetimeIndex, zmax: pd.Series,
 
 def _sample_blocks(rng: np.random.Generator, w: np.ndarray, T: int,
                    n_draws: int, S: int, L: float) -> np.ndarray:
-    """[n_draws, S] matrix of row indexes into the shared z frame —
+    """[n_draws, S] matrix of row indexes into the shared z frame -
     stationary block bootstrap: with prob 1/L open a new block at a
     weighted start, else continue the previous row."""
     idx = np.empty((n_draws, S), dtype=np.int64)
@@ -183,7 +232,19 @@ def simulate(models: list[AssetModel], step_counts: dict[tuple[str, int], int],
     is_lr = np.array([m.notes.get("target_type") == "log_return"
                       for m in models])
     innov[:, :, is_lr] = np.log1p(np.clip(innov[:, :, is_lr], -0.999999, None))
-    cum = np.cumsum(innov, axis=1)
+    phis = np.array([m.phi for m in models])
+    if phis.any():
+        # path_{t} = path_{t-1}*(1-phi) + innov_t : AR pull toward the
+        # anchor on the assets that measured mean-reversion; phi=0 rows
+        # reproduce cumsum exactly.
+        cum = np.empty_like(innov)
+        prev = np.zeros((n_draws, A))
+        one_minus = 1.0 - phis[None, :]
+        for t in range(S):
+            prev = prev * one_minus + innov[:, t, :]
+            cum[:, t, :] = prev
+    else:
+        cum = np.cumsum(innov, axis=1)
 
     out = np.empty((n_draws, A, len(horizons)))
     for ai, m in enumerate(models):

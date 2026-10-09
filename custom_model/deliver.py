@@ -5,7 +5,7 @@
                            exactly n_draws x n_cells rows (limits.py's
                            expect_exact_rows bound)
     forecast_meta.json     schema keys + our audit block
-    forecast_rationale.md  numbered derivation with doc citations —
+    forecast_rationale.md  numbered derivation with doc citations -
                            a review screen over the leaderboard, never
                            scored, so it must be honest and checkable
 """
@@ -52,7 +52,7 @@ def write_parquet(samples: np.ndarray, assets: list[str],
 def write_meta(out: pathlib.Path, bundle, n_draws: int, method: str,
                stats: dict) -> None:
     # g2 bind_metadata requires meta.asof == trusted_asof(card) EXACTLY, and
-    # trusted_asof reads [forecast].asof BEFORE [provenance].data_cutoff —
+    # trusted_asof reads [forecast].asof BEFORE [provenance].data_cutoff -
     # the precedence order is contractual, not cosmetic.
     card_asof = str(bundle.card.get("forecast", {}).get("asof")
                     or bundle.card.get("provenance", {}).get("data_cutoff")
@@ -68,7 +68,7 @@ def write_meta(out: pathlib.Path, bundle, n_draws: int, method: str,
         "rationale": {"file": "forecast_rationale.md", "method": method},
         "reasoning_applied": bool(stats.get("text", {}).get("applied")),
         "reasoning_skipped_reason": stats.get("text", {}).get("skipped", ""),
-        "custom": {"version": "4.0.0", "stats": stats},
+        "custom": {"version": "5.0.0", "stats": stats},
     }
     if bundle.target_type in ("level", "log_return", "yield"):
         meta["target"] = bundle.target_type
@@ -80,7 +80,7 @@ def write_rationale(out: pathlib.Path, bundle, stats: dict, method: str) -> None
     adj = stats.get("text", {}).get("ledger", {})
     cal = stats.get("calibration", {})
     lines = [
-        f"# Forecast rationale — {bundle.card_id}",
+        f"# Forecast rationale - {bundle.card_id}",
         "",
         f"As-of {bundle.asof}. Target {bundle.target_type} "
         f"({bundle.target_frequency}). Assets: {', '.join(bundle.target_assets)}. "
@@ -112,7 +112,7 @@ def write_rationale(out: pathlib.Path, bundle, stats: dict, method: str) -> None
         elif isinstance(rec, dict) and rec.get("applied"):
             lines.append(f"- {a}: drift {rec['drift_bp']:+.1f}bp "
                          f"vol x{rec['vol_scale']:.2f} skew {rec['skew']:+.2f} "
-                         f"— {rec['why']}")
+                         f"- {rec['why']}")
     lines += ["", "## Calibration"]
     for a, st in cal.get("stats", {}).items():
         lines.append(f"- {a}: {st}")
@@ -134,7 +134,7 @@ def write_all(out: pathlib.Path, samples: np.ndarray, bundle,
               stats: dict, method: str) -> None:
     # g0 requires the output tree to hold EXACTLY the three contract files.
     # Purge leftover *.tmp (from a kill between write and os.replace on a
-    # previous stage) before producing anything — a stray file refuses the
+    # previous stage) before producing anything - a stray file refuses the
     # whole submission even when the parquet itself is valid.
     try:
         for stale in pathlib.Path(out).parent.glob("*.tmp"):

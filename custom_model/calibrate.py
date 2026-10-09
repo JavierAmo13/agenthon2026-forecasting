@@ -4,7 +4,7 @@
 Re-run the same engine at past origins and compare its predicted quantiles
 with the values that actually followed (all inside the panel's own history,
 all <= asof). The per-cell PIT histogram tells us whether our distribution
-is systematically off-center or mis-width — we then apply a bounded affine
+is systematically off-center or mis-width - we then apply a bounded affine
 correction per cell (shift + spread around the median), shrunk toward
 identity as the sample thins.
 
@@ -41,7 +41,7 @@ def calibrate(bundle, models: list[AssetModel],
 
     For each usable origin the SAME engine runs on the series truncated at
     the origin date; the realized continuation comes straight from the
-    series itself — every point is inside the panel, so no leakage.
+    series itself - every point is inside the panel, so no leakage.
     """
     from .engine import _build_asset_model
 
@@ -79,7 +79,7 @@ def calibrate(bundle, models: list[AssetModel],
         for hi, h in enumerate(bundle.horizons):
             ps = np.array(pits[h])
             if len(ps) < 8:
-                corr[(m.asset, h)] = (0.0, 1.0)
+                corr[(m.asset, h)] = (0.0, 1.0, 1.0)
                 stats[m.asset][f"h{h}"] = {"n": len(ps), "note": "thin"}
                 continue
             w = len(ps) / (len(ps) + 8.0)
@@ -89,10 +89,27 @@ def calibrate(bundle, models: list[AssetModel],
             scale = iqr / 0.5
             scale = float(np.clip(1 + w * (scale - 1), 0.75, 1.45))
             shift_sd = float(np.clip(w * shift_sd, -0.45, 0.45))
-            corr[(m.asset, h)] = (shift_sd, scale)
+            # Asymmetric tails: a realized landing above q90 more than 10%
+            # of origins means our predicted upper tail is too short -
+            # stretch that side only. One-sided corrections keep the other
+            # flank where the evidence put it.
+            import os
+            # medido en el harness local (94 unidades): la correccion
+            # asimetrica empeoro F2 ~0.15 comp -> desactivada por defecto
+            if os.environ.get("ASYMCAL", "0") != "0":
+                lo_share = float(np.mean(ps < 0.10))
+                hi_share = float(np.mean(ps > 0.90))
+                lo_adj = float(np.clip(1 + w * (lo_share / 0.10 - 1) * 0.6,
+                                       0.7, 1.6))
+                hi_adj = float(np.clip(1 + w * (hi_share / 0.10 - 1) * 0.6,
+                                       0.7, 1.6))
+            else:
+                lo_adj = hi_adj = 1.0
+            corr[(m.asset, h)] = (shift_sd, scale * lo_adj, scale * hi_adj)
             stats[m.asset][f"h{h}"] = {"n": len(ps),
                                        "shift_sd": round(shift_sd, 3),
-                                       "scale": round(scale, 3),
+                                       "scale_lo": round(scale * lo_adj, 3),
+                                       "scale_hi": round(scale * hi_adj, 3),
                                        "pit_med": round(med, 3)}
     return {"corr": corr, "stats": stats}
 
@@ -101,20 +118,25 @@ def apply_corrections(samples: np.ndarray, assets: list[str], horizons: list[int
                       corr: dict) -> np.ndarray:
     """Affine per-cell correction around the draw median.
 
-    cells flatten in card order: asset-major, horizon-minor — the scorer's
+    cells flatten in card order: asset-major, horizon-minor - the scorer's
     own order. A per-coordinate monotone transform keeps each draw a valid
     joint scenario (the copula ordering is preserved).
     """
     d = len(assets) * len(horizons)
     mat = samples.reshape(samples.shape[0], d) if samples.ndim == 3 else samples
     for i, (a, h) in enumerate((a, h) for a in assets for h in horizons):
-        shift_sd, scale = corr.get((a, h), (0.0, 1.0))
-        if shift_sd == 0.0 and scale == 1.0:
+        c = corr.get((a, h), (0.0, 1.0, 1.0))
+        shift_sd = c[0]
+        scale_lo = c[1] if len(c) > 1 else 1.0
+        scale_hi = c[2] if len(c) > 2 else scale_lo
+        if shift_sd == 0.0 and scale_lo == 1.0 and scale_hi == 1.0:
             continue
         col = mat[:, i]
         med = np.median(col)
         sd = np.std(col)
         if not np.isfinite(sd) or sd <= 0:
             continue
-        mat[:, i] = med + (col - med) * scale + shift_sd * sd
+        dev = col - med
+        dev = np.where(dev > 0, dev * scale_hi, dev * scale_lo)
+        mat[:, i] = med + dev + shift_sd * sd
     return samples
