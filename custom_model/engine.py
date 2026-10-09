@@ -56,6 +56,12 @@ class AssetModel:
     drift_step: float       # per-step drift to add on the path
     cadence: str            # 'daily' | 'monthly'
     notes: dict = field(default_factory=dict)
+    sigma_pool: np.ndarray | None = None
+    # When set (transfer assets), each draw samples its per-step sigma
+    # from the asset's own historical vol-regime distribution, biased to
+    # the stressed regime. This is a scale mixture over the asset's own
+    # history: honest dispersion for an asset whose recent regime is
+    # withheld, rather than a point estimate of a calm endpoint.
 
 
 def _build_asset_model(asset: str, s: pd.Series, bundle,
@@ -161,7 +167,15 @@ def simulate(models: list[AssetModel], step_counts: dict[tuple[str, int], int],
 
     sig = np.array([m.sigma_now for m in models])
     mu = np.array([m.drift_step for m in models])
-    innov = Z[pick] * sig[None, None, :] + mu[None, None, :]   # [d, S, A]
+    # per-draw sigma matrix: transfer assets draw their regime scale from
+    # their own early-window sigma path (size-biased toward stress)
+    sig_d = np.tile(sig, (n_draws, 1))
+    for ai, m in enumerate(models):
+        if m.sigma_pool is not None and len(m.sigma_pool) > 30:
+            pool = np.asarray(m.sigma_pool, dtype=float)
+            w = pool / pool.sum()
+            sig_d[:, ai] = rng.choice(pool, size=n_draws, p=w)
+    innov = Z[pick] * sig_d[:, None, :] + mu[None, None, :]   # [d, S, A]
     # log_return cells accumulate log(1+r), matching the realized target
     is_lr = np.array([m.notes.get("target_type") == "log_return"
                       for m in models])

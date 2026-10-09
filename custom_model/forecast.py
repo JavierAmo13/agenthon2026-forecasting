@@ -108,13 +108,45 @@ def _transfer_adjust(bundle, models: list[AssetModel], stats: dict) -> None:
         end = s.index[-2] if len(s) > 1 else s.index[-1]
         ratio = transfer.basket_regime_ratio(
             bundle, end, exclude=set(bundle.target_assets))
+        # EM FX is structurally more volatile than the G10 basket, and the
+        # withheld years are precisely the ones that carry today's regime —
+        # never let a calm-basket ratio SHRINK the early-window sigma. And
+        # the EWMA endpoint of a window that ends in a calm patch under-
+        # reads the regime: use the asset's own stressed history as floor.
+        # EM FX is structurally more volatile than the G10 basket, and the
+        # withheld years are precisely the ones that carry today's regime —
+        # never let a calm-basket ratio SHRINK the early-window sigma. The
+        # per-draw scale is the asset's own EWMA path (a regime library):
+        # a scale mixture over its observed history, lifted by the basket's
+        # regime move and floored at its stressed quantile.
+        x_early = st.clean_steps(s[s.index <= end], bundle.target_type)
+        pool = st.ewma_vol(x_early).dropna().to_numpy()
+        s75 = float(np.percentile(pool, 75)) if len(pool) else m.sigma_now
+        basket_now = transfer.basket_sigma_now(
+            bundle, exclude=set(bundle.target_assets))
+        em_beta = 1.5
+        # floor: the context basket's CURRENT RELATIVE sigma (fraction of
+        # level) times an EM beta, converted to this asset's units via its
+        # as-of anchor. Playbook-sanctioned width for a series whose recent
+        # regime is withheld; the early window may carry no crisis memory.
+        floor = (basket_now * em_beta * 0.8 * abs(m.anchor)
+                 if basket_now > 0 and abs(m.anchor) > 0 else old)
+        ratio_eff = max(ratio, 1.0) * em_beta
         old = m.sigma_now
-        m.sigma_now = float(np.clip(m.sigma_now * ratio,
-                                    m.sigma_now * 0.6, m.sigma_now * 3.0))
+        base = max(m.sigma_now, s75, floor)
+        m.sigma_now = float(np.clip(base * max(ratio_eff, 1.0),
+                                    old, base * 4.0))
+        if len(pool) > 30:
+            m.sigma_pool = np.maximum(
+                pool * max(ratio, 1.0) * 1.3,
+                floor if floor > 0 else m.sigma_now * 0.5)
         stats["transfer"][m.asset] = {"early_end": str(end)[:10],
                                       "basket_ratio": round(ratio, 3),
+                                      "stressed_sigma": round(s75, 5),
+                                      "basket_now": round(basket_now, 5),
                                       "sigma_old": round(old, 5),
-                                      "sigma_new": round(m.sigma_now, 5)}
+                                      "sigma_new": round(m.sigma_now, 5),
+                                      "sigma_pool_n": int(len(pool))}
 
 
 def _synthesize_missing(bundle, stats: dict) -> list[AssetModel]:

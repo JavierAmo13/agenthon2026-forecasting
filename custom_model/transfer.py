@@ -56,3 +56,42 @@ def basket_regime_ratio(bundle, end_date: pd.Timestamp,
     if not ratios:
         return 1.0
     return float(np.clip(np.median(ratios), 0.5, 3.0))
+
+
+def basket_sigma_now(bundle, exclude: set[str]) -> float:
+    """Median current EWMA per-step sigma across context series.
+
+    The playbook's sanctioned width for a transfer asset: the related
+    panel's vol scaled by a beta. The basket's CURRENT sigma is the only
+    honest in-sample read of today's regime; the early window alone is
+    blind to it (a pegged CNY window carries no crisis memory at all).
+    """
+    vals = []
+    for a, s in bundle.all_series().items():
+        if a in exclude or s is None or len(s) < 60:
+            continue
+        x = s.astype(float)
+        lvl = abs(float(x.iloc[-1]))
+        if float(x.abs().median()) < 0.5:
+            steps = x          # returns-style panel: already relative-ish
+        else:
+            steps = x.diff() / lvl if lvl > 0 else x.diff()
+        steps = steps.dropna()
+        if len(steps) < 60:
+            continue
+        vals.append(float(st.ewma_vol(steps).iloc[-1]))
+    return float(np.median(vals)) if vals else 0.0
+
+
+def stressed_sigma_floor(bundle, series: pd.Series) -> float:
+    """75th percentile of the EWMA sigma path over the asset's OWN early
+    window — the dispersion it showed when it was stressed, not the calm
+    reading at the window's end. The early windows contain the asset's
+    real crises (BRL 1999 deval, INR 1997-98, CNY regime changes); a
+    transfer card asks for the NEW regime, so the calm-endpoint sigma
+    under-covers by construction."""
+    x = st.clean_steps(series, bundle.target_type)
+    if len(x) < 30:
+        return 0.0
+    sig = st.ewma_vol(x)
+    return float(np.percentile(sig.dropna(), 75))

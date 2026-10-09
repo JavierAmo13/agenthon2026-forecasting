@@ -20,32 +20,86 @@ plus
   anchors     per-asset level estimates ONLY for assets absent from the
               panels or with a withheld middle (transfer cards)
 
-The endpoint contract: POST $MODEL_ENDPOINT/v1/chat/completions with
-MODEL_NAME / MODEL_TOKEN through the audited proxy (urllib honours
-HTTP_PROXY/HTTPS_PROXY). No third-party endpoints exist on the network;
-a missing endpoint degrades to the statistical floor, labelled.
+The endpoint contract mirrors baselines/reasoning_agent.py exactly:
+MODEL_TOKEN present -> HTTP to the $http_proxy host:port, absolute-URI
+POST to {MODEL_ENDPOINT netloc}/v1/chat/completions with Bearer +
+Proxy-Authorization. MODEL_TOKEN absent -> direct POST to
+$MODEL_ENDPOINT/chat/completions with optional MODEL_API_KEY (local dev).
+A missing endpoint degrades to the statistical floor, labelled.
 """
 
 from __future__ import annotations
 
+import base64
+import http.client
 import json
 import os
 import re
+import urllib.error
 import urllib.request
+from urllib.parse import unquote, urlsplit
 
 MAX_DOC_CHARS = 3500
 MAX_DOCS = 14
-TIMEOUT = 75.0
-OUT_TOKENS = 3500          # under the 4000 admitted cap
+TIMEOUT = 60.0
+OUT_TOKENS = 3000          # MODEL_MAX_TOKENS default; House cap is 4000
+HOUSE_OUTPUT_TOKENS = 4000
+RESPONSE_BYTES = 1024 * 1024
 
 
 def endpoint() -> str | None:
     ep = os.environ.get("MODEL_ENDPOINT", "").strip()
-    return ep.rstrip("/") + "/v1" if ep else None
+    return ep or None
 
 
 def available() -> bool:
     return bool(endpoint() and os.environ.get("MODEL_NAME"))
+
+
+def _house_reply(endpoint: str, token: str, body: bytes):
+    """The organizer route: the audited receipt proxy, reached exactly the
+    way baselines/reasoning_agent.py reaches it — plain HTTP to the proxy,
+    absolute-URI request target, Bearer for the model and Basic for the
+    proxy. The URL path is always /v1/chat/completions on the endpoint's
+    netloc (the endpoint itself may or may not carry /v1)."""
+    target = urlsplit(endpoint)
+    proxy = urlsplit(os.environ.get("http_proxy", ""))
+    if (target.scheme != "http" or not target.hostname
+            or target.username is not None or target.password is not None
+            or target.path.rstrip("/") not in ("", "/v1")
+            or target.query or target.fragment
+            or proxy.scheme != "http" or not proxy.hostname
+            or not proxy.port or proxy.path not in ("", "/")
+            or proxy.query or proxy.fragment
+            or not proxy.username or not proxy.password
+            or not token
+            or any(ord(c) < 33 or ord(c) > 126 for c in token)):
+        raise ValueError("invalid House model or proxy configuration")
+    creds = unquote(proxy.username) + ":" + unquote(proxy.password)
+    if any(ord(c) < 32 or ord(c) > 126 for c in creds):
+        raise ValueError("invalid House proxy credentials")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + token,
+        "Proxy-Authorization": "Basic " +
+                               base64.b64encode(creds.encode()).decode(),
+    }
+    conn = http.client.HTTPConnection(proxy.hostname, proxy.port,
+                                      timeout=TIMEOUT)
+    try:
+        conn.request(
+            "POST",
+            target.scheme + "://" + target.netloc + "/v1/chat/completions",
+            body, headers)
+        resp = conn.getresponse()
+        if resp.status != 200:
+            raise ValueError("House model request was refused")
+        raw = resp.read(RESPONSE_BYTES + 1)
+        if len(raw) > RESPONSE_BYTES:
+            raise ValueError("House model response was too large")
+        return json.loads(raw)
+    finally:
+        conn.close()
 
 
 def pick_docs(docs, asof: str) -> tuple[list, int]:
@@ -122,35 +176,59 @@ def build_prompt(bundle, docs, ctx: dict) -> str:
     return "\n".join(lines)
 
 
-def chat(prompt: str, max_tokens: int = OUT_TOKENS) -> tuple[dict | None, str]:
-    """One POST to the House route; no retry (a spent admission is spent).
-    Returns (parsed_json, reason_if_failed)."""
+def chat(prompt: str, max_tokens: int | None = None) -> tuple[dict | None, str]:
+    """One call to the model route; no retry (a spent admission is spent).
+    Returns (parsed_json, reason_if_failed). House route when MODEL_TOKEN
+    is present (authenticated proxy); else the local MODEL_API_KEY path.
+    """
     if not available():
         return None, "MODEL_ENDPOINT/MODEL_NAME unset"
+    thinking = os.environ.get("MODEL_THINKING", "off").strip().lower() \
+        in ("1", "on", "true")
+    try:
+        mt = max(1, int(os.environ.get("MODEL_MAX_TOKENS",
+                                       str(max_tokens or OUT_TOKENS))))
+    except ValueError:
+        return None, "MODEL_MAX_TOKENS is not an integer"
+    ep = endpoint()
+    house = "MODEL_TOKEN" in os.environ
+    if house:
+        mt = min(mt, HOUSE_OUTPUT_TOKENS)
     body = json.dumps({
         "model": os.environ["MODEL_NAME"],
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
-        "max_tokens": max_tokens,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "max_tokens": mt,
+        "chat_template_kwargs": {"enable_thinking": thinking},
     }).encode()
-    req = urllib.request.Request(
-        endpoint() + "/chat/completions", data=body, method="POST",
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {os.environ.get('MODEL_TOKEN', '')}"})
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            payload = json.loads(r.read().decode())
-    except Exception as e:
-        return None, f"house request failed ({type(e).__name__})"
+        if house:
+            payload = _house_reply(ep, os.environ["MODEL_TOKEN"], body)
+        else:
+            req = urllib.request.Request(
+                ep.rstrip("/") + "/chat/completions", data=body,
+                method="POST",
+                headers={"Content-Type": "application/json"})
+            token = os.environ.get("MODEL_API_KEY", "").strip()
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                payload = json.loads(r.read().decode())
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError,
+            http.client.HTTPException) as e:
+        return None, f"model request failed ({type(e).__name__})"
     try:
-        content = payload["choices"][0]["message"]["content"]
-    except Exception:
+        choice = payload["choices"][0]
+        content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError):
         return None, "reply had no choices[0].message.content"
     if not isinstance(content, str):
-        return None, "reply content was not a string"
+        return None, "choices[0].message.content was not a string"
     i, j = content.find("{"), content.rfind("}")
     if i < 0 or j <= i:
+        if choice.get("finish_reason") == "length":
+            return None, ("reply hit max_tokens before emitting JSON "
+                          "(MODEL_THINKING/MODEL_MAX_TOKENS)")
         return None, "reply contained no JSON object"
     try:
         return json.loads(content[i:j + 1]), ""
