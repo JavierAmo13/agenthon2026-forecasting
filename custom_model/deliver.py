@@ -38,17 +38,24 @@ def write_parquet(samples: np.ndarray, assets: list[str],
     out = pathlib.Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.name + ".tmp")
-    df.to_parquet(tmp, index=False, compression="zstd")
+    for comp in ("zstd", "snappy", None):
+        try:
+            df.to_parquet(tmp, index=False, compression=comp)
+            break
+        except Exception:
+            continue
+    else:
+        raise ValueError("cannot write forecast.parquet (no codec works)")
     os.replace(tmp, out)
 
 
 def write_meta(out: pathlib.Path, bundle, n_draws: int, method: str,
                stats: dict) -> None:
-    # g2 binds meta.asof to the card's declared cutoff. The CLI --asof is the
-    # knowledge cutoff for data reads; the sidecar echoes the card's own value
-    # so a mismatch is never a metadata fault. They coincide on real runs.
-    card_asof = str(bundle.card.get("provenance", {}).get("data_cutoff")
-                    or bundle.card.get("forecast", {}).get("asof")
+    # g2 bind_metadata requires meta.asof == trusted_asof(card) EXACTLY, and
+    # trusted_asof reads [forecast].asof BEFORE [provenance].data_cutoff —
+    # the precedence order is contractual, not cosmetic.
+    card_asof = str(bundle.card.get("forecast", {}).get("asof")
+                    or bundle.card.get("provenance", {}).get("data_cutoff")
                     or bundle.asof)[:10]
     meta = {
         "unit_id": bundle.card_id,
@@ -61,7 +68,7 @@ def write_meta(out: pathlib.Path, bundle, n_draws: int, method: str,
         "rationale": {"file": "forecast_rationale.md", "method": method},
         "reasoning_applied": bool(stats.get("text", {}).get("applied")),
         "reasoning_skipped_reason": stats.get("text", {}).get("skipped", ""),
-        "custom": {"version": "3.0.0", "stats": stats},
+        "custom": {"version": "4.0.0", "stats": stats},
     }
     if bundle.target_type in ("level", "log_return", "yield"):
         meta["target"] = bundle.target_type
@@ -125,6 +132,24 @@ def write_rationale(out: pathlib.Path, bundle, stats: dict, method: str) -> None
 
 def write_all(out: pathlib.Path, samples: np.ndarray, bundle,
               stats: dict, method: str) -> None:
+    # g0 requires the output tree to hold EXACTLY the three contract files.
+    # Purge leftover *.tmp (from a kill between write and os.replace on a
+    # previous stage) before producing anything — a stray file refuses the
+    # whole submission even when the parquet itself is valid.
+    try:
+        for stale in pathlib.Path(out).parent.glob("*.tmp"):
+            stale.unlink()
+    except OSError:
+        pass
+    # parquet is the scored artifact and must succeed; sidecars are
+    # best-effort so a metadata serialization quirk can never eat the run.
     write_parquet(samples, bundle.target_assets, bundle.horizons, out)
-    write_meta(out, bundle, samples.shape[0], method, stats)
-    write_rationale(out, bundle, stats, method)
+    import sys, traceback
+    for fn in (write_meta, write_rationale):
+        try:
+            if fn is write_meta:
+                fn(out, bundle, samples.shape[0], method, stats)
+            else:
+                fn(out, bundle, stats, method)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)

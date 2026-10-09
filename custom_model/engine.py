@@ -158,10 +158,13 @@ def simulate(models: list[AssetModel], step_counts: dict[tuple[str, int], int],
     T = len(Z)
     if T < 5:
         Z = rng.standard_normal((200, A))
+        idx_dates = pd.RangeIndex(200)
         T = 200
+    else:
+        idx_dates = Zf.index
 
-    zmax = pd.Series(np.abs(Z).max(axis=1), index=Zf.index)
-    w = _start_weights(Zf.index, zmax, cadence, tail_boost)
+    zmax = pd.Series(np.abs(Z).max(axis=1), index=idx_dates)
+    w = _start_weights(idx_dates, zmax, cadence, tail_boost)
     L = BLOCK_LEN_M if cadence == "monthly" else BLOCK_LEN_D
     pick = _sample_blocks(rng, w, T, n_draws, S, L)
 

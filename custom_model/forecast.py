@@ -37,7 +37,10 @@ from . import deliver, text, transfer, apply, selfcheck
 
 DEFAULT_DRAWS = 3000
 MAX_DRAWS = 20_000
-TIME_BUDGET = 1100.0
+# The stage clock (43,200 s) is shared across ~104 units — ~400 s each once
+# the cold pull is billed. The internal ceiling stays well under that so one
+# pathological card cannot starve the rest of the roster.
+TIME_BUDGET = 300.0
 
 
 def _find_unit(panels_arg: pathlib.Path) -> pathlib.Path:
@@ -52,6 +55,42 @@ def _unit_seed(card_id: str) -> int:
     return (zlib.crc32(card_id.encode()) & 0x7FFFFFFF) ^ 0x5EED
 
 
+def _card_minimal_bundle(unit_dir: pathlib.Path, asof: str):
+    """Last-resort bundle: parse card.toml only. If panels/spec/text are
+    unreadable we can still honour the contract with a wide gaussian floor —
+    a failed load must not become an empty /output."""
+    import tomllib
+    from .load import DataBundle
+    try:
+        card = tomllib.loads(
+            (unit_dir / "card.toml").read_text(encoding="utf-8"))
+        tgt = card.get("targets", {})
+        assets = list(tgt.get("asset_ids") or [])
+        horizons = [int(h) for h in tgt.get("horizons") or []]
+        if not assets or not horizons:
+            return None
+        b = DataBundle(
+            unit_dir=unit_dir, card=card, spec={},
+            card_id=card.get("task", {}).get("id", unit_dir.name),
+            family=card.get("metadata", {}).get("category", ""),
+            asof=str(asof or card.get("forecast", {}).get("asof",
+                   card.get("provenance", {}).get("data_cutoff", "2024-01-01")))[:10],
+            target_assets=assets, horizons=horizons,
+            target_type=tgt.get("target_type", "level"),
+            target_frequency=tgt.get("target_frequency",
+                card.get("metadata", {}).get("target_frequency", "daily")),
+            value_unit=str(tgt.get("value_unit", "")),
+            n_draws_min=int(card.get("scoring", {}).get("params", {})
+                            .get("n_draws_min") or 200),
+            panels={}, texts=[])
+        b.present_assets = []
+        b.missing_assets = list(assets)
+        return b
+    except Exception as exc:
+        print(f"card-minimal bundle failed: {exc}", file=sys.stderr)
+        return None
+
+
 def _gaussian_floor(bundle, n_draws: int, seed: int) -> np.ndarray:
     """M0-faithful correlated Gaussian walk — the guaranteed floor."""
     rng = np.random.default_rng(seed ^ 0xF00D)
@@ -64,23 +103,30 @@ def _gaussian_floor(bundle, n_draws: int, seed: int) -> np.ndarray:
         if s is None or len(s) < 2:
             diffs[a] = np.zeros(0); last[a] = 0.0; mu[a] = 0.0; continue
         x = st.clean_steps(s, bundle.target_type).iloc[-300:]
+        x = x[np.isfinite(x.to_numpy(dtype=float))]
         diffs[a] = x.to_numpy(dtype=float)
-        last[a] = 0.0 if bundle.target_type == "log_return" else float(s.iloc[-1])
+        lv = float(s.iloc[-1])
+        last[a] = (0.0 if bundle.target_type == "log_return"
+                   else lv if np.isfinite(lv) else 0.0)
         mu[a] = float(x.mean()) if len(x) else 0.0
+        if not np.isfinite(mu[a]):
+            mu[a] = 0.0
     wide = np.full((S, len(assets)), 0.0)
-    sd = np.array([max(float(np.std(diffs[a])), 1e-6) if len(diffs[a]) else 1.0
-                   for a in assets])
+    sd = np.array([max(float(np.std(diffs[a])), 1e-6)
+                   if len(diffs[a]) else 1.0 for a in assets])
+    sd = np.where(np.isfinite(sd), sd, 1.0)
     if len(assets) > 1:
         m = max(len(diffs[a]) for a in assets)
         X = np.full((m, len(assets)), np.nan)
         for i, a in enumerate(assets):
             X[:len(diffs[a]), i] = diffs[a]
         C = np.corrcoef(X[~np.isnan(X).any(axis=1)].T) if len(X) > 20 else np.eye(len(assets))
-        C = np.nan_to_num(C, nan=0.0)
+        C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
         np.fill_diagonal(C, 1.0)
         w, v = np.linalg.eigh(C)
         C = v @ np.diag(np.clip(w, 1e-8, None)) @ v.T
         dd = np.sqrt(np.diag(C))
+        dd = np.where(dd > 0, dd, 1.0)
         C = C / np.outer(dd, dd)
         try:
             L = np.linalg.cholesky(C)
@@ -95,6 +141,11 @@ def _gaussian_floor(bundle, n_draws: int, seed: int) -> np.ndarray:
         for hi, h in enumerate(horizons):
             sc = max(1, steps_map.get((a, h), h))
             out[:, ai, hi] = last[a] + mu[a] * sc + cum[:, sc - 1, ai]
+        # a floor submission may never ship a non-finite cell
+        sl = out[:, ai, :]
+        bad = ~np.isfinite(sl)
+        if bad.any():
+            sl[bad] = last[a]
     return out
 
 
@@ -222,41 +273,48 @@ def run_bundle(bundle, *, n_draws: int, seed: int,
             stats["calibration"] = {"error": str(e)[:200]}
 
     # --- stage 2: House text overlay --------------------------------------
+    # Wrapped: a text-layer failure must never eat the statistical forecast.
     if use_text and not expired():
-        docs, skipped = text.pick_docs(bundle.texts, bundle.asof)
-        stats["text"]["docs_used"] = len(docs)
-        stats["text"]["docs_skipped"] = skipped
-        if not docs:
-            stats["text"]["skipped"] = "no admissible documents"
-        elif not text.available():
-            stats["text"]["skipped"] = "house endpoint unset"
-        else:
-            ctx = {}
-            for m in models:
-                smax = max(step_counts[(m.asset, h)] for h in bundle.horizons)
-                s = bundle.series(m.asset)
-                hist = "full"
-                if s is not None and transfer.detect_transfer(bundle, s):
-                    hist = f"early_window_to_{s.index[-2].date()}+asof_row"
-                elif m.notes.get("synthetic"):
-                    hist = "absent"
-                ctx[m.asset] = {"anchor": m.anchor, "sigma_h": m.sigma_now *
-                                float(np.sqrt(smax)), "steps": smax,
-                                "history": hist}
-            reply, reason = text.chat(text.build_prompt(bundle, docs, ctx))
-            if reply is None:
-                stats["text"]["skipped"] = reason
+        try:
+            docs, skipped = text.pick_docs(bundle.texts, bundle.asof)
+            stats["text"]["docs_used"] = len(docs)
+            stats["text"]["docs_skipped"] = skipped
+            if not docs:
+                stats["text"]["skipped"] = "no admissible documents"
+            elif not text.available():
+                stats["text"]["skipped"] = "house endpoint unset"
             else:
-                cell_sd = {(a, h): float(np.std(samples[:, ai, hi]))
-                           for ai, a in enumerate(bundle.target_assets)
-                           for hi, h in enumerate(bundle.horizons)}
-                anchors = {m.asset: m.anchor for m in models}
-                samples, ledger = apply.apply_adjustments(
-                    samples, bundle.target_assets, bundle.horizons,
-                    anchors, cell_sd, reply, bundle.target_type)
-                stats["text"]["applied"] = True
-                stats["text"]["skipped"] = ""
-                stats["text"]["ledger"] = ledger
+                ctx = {}
+                for m in models:
+                    smax = max(step_counts[(m.asset, h)] for h in bundle.horizons)
+                    s = bundle.series(m.asset)
+                    hist = "full"
+                    if s is not None and transfer.detect_transfer(bundle, s):
+                        hist = f"early_window_to_{s.index[-2].date()}+asof_row"
+                    elif m.notes.get("synthetic"):
+                        hist = "absent"
+                    ctx[m.asset] = {"anchor": m.anchor, "sigma_h": m.sigma_now *
+                                    float(np.sqrt(smax)), "steps": smax,
+                                    "history": hist}
+                reply, reason = text.chat(text.build_prompt(bundle, docs, ctx))
+                if reply is None:
+                    stats["text"]["skipped"] = reason
+                else:
+                    cell_sd = {(a, h): float(np.std(samples[:, ai, hi]))
+                               for ai, a in enumerate(bundle.target_assets)
+                               for hi, h in enumerate(bundle.horizons)}
+                    anchors = {m.asset: m.anchor for m in models}
+                    samples, ledger = apply.apply_adjustments(
+                        samples, bundle.target_assets, bundle.horizons,
+                        anchors, cell_sd, reply, bundle.target_type,
+                        vol_clamp=(0.8, 2.4), drift_cap=1.5)
+                    stats["text"]["applied"] = bool(
+                        any(v.get("applied") for v in ledger.values()
+                            if isinstance(v, dict))
+                        or any(v for k, v in ledger.items() if k == "_scenarios"))
+                    stats["text"]["ledger"] = ledger
+        except Exception as e:
+            stats["text"]["skipped"] = f"overlay error: {e}"[:200]
 
     # family prior: a card self-declared F4 ("tail/shock from text") tells
     # the task itself that an extreme move sits in the horizon. When no
@@ -307,11 +365,40 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     unit_dir = _find_unit(a.panels)
-    bundle = load_unit(unit_dir, asof=a.asof)
+    if a.card is not None and pathlib.Path(a.card).is_file():
+        # explicit --card wins over directory probing (the harness may pass it)
+        card_dir = pathlib.Path(a.card).parent
+        if (card_dir / "card.toml").is_file():
+            unit_dir = card_dir
+    try:
+        bundle = load_unit(unit_dir, asof=a.asof)
+    except Exception as exc:
+        print(f"load_unit failed ({type(exc).__name__}: {exc}); "
+              f"trying card-minimal bundle", file=sys.stderr)
+        bundle = _card_minimal_bundle(unit_dir, a.asof)
+        if bundle is None:
+            return 2
     n_draws = max(a.n_draws or DEFAULT_DRAWS, bundle.n_draws_min, 200)
     n_draws = min(n_draws, MAX_DRAWS)
     seed = a.seed if a.seed is not None else _unit_seed(bundle.card_id)
     deadline = time.time() + a.time_budget
+
+    # Guaranteed output FIRST: the container's kill window is not ours, so a
+    # valid gaussian-floor submission lands on disk before any compute. Every
+    # later stage only rewrites it with a better forecast; a kill or crash at
+    # any point leaves this in place.
+    stats = {"unit": bundle.card_id, "asof": bundle.asof,
+             "fallback": True, "reason": "floor written before pipeline ran",
+             "text": {"applied": False, "skipped": "pipeline pending"},
+             "calibration": {}, "transfer": {}, "engine": {}}
+    try:
+        floor_samples = _gaussian_floor(bundle, n_draws, seed)
+        deliver.write_all(a.out, floor_samples, bundle, stats,
+                          "M0-faithful gaussian floor")
+    except Exception as exc:
+        print(f"floor write failed ({type(exc).__name__}: {exc}); "
+              f"continuing to pipeline", file=sys.stderr)
+
     try:
         samples, stats = run_bundle(bundle, n_draws=n_draws, seed=seed,
                                     deadline=deadline, use_text=not a.no_text)
@@ -321,18 +408,19 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("selfcheck: " + "; ".join(errs))
     except Exception as exc:
         print(f"pipeline failed ({type(exc).__name__}: {exc}); "
-              f"emitting gaussian floor", file=sys.stderr)
-        stats = {"unit": bundle.card_id, "asof": bundle.asof,
-                 "fallback": True, "reason": f"pipeline error: {exc}"[:200],
-                 "text": {"applied": False, "skipped": "pipeline error"},
-                 "calibration": {}, "transfer": {}, "engine": {}}
-        samples = _gaussian_floor(bundle, n_draws, seed)
+              f"floor submission remains in place", file=sys.stderr)
+        return 0
 
     method = ("regime-scaled joint block bootstrap + conformal calibration"
               + (" + House text overlay" if stats.get("text", {}).get("applied")
                  else " (text skipped: "
                       + stats.get("text", {}).get("skipped", "n/a") + ")"))
-    deliver.write_all(a.out, samples, bundle, stats, method)
+    try:
+        deliver.write_all(a.out, samples, bundle, stats, method)
+    except Exception as exc:
+        print(f"final write failed ({type(exc).__name__}: {exc}); "
+              f"floor submission remains in place", file=sys.stderr)
+        return 0
     print(f"wrote {a.out}: {samples.shape[0]} draws x "
           f"{len(bundle.target_assets)} assets x {len(bundle.horizons)} horizons")
     return 0

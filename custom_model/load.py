@@ -139,8 +139,21 @@ def _load_texts(unit: pathlib.Path) -> list[TextDoc]:
 
 def _resolve_asof(unit: pathlib.Path, card: dict, spec: dict,
                   cli_asof: str | None) -> str:
+    # Data reads are bounded by the EARLIEST declared cutoff: the CLI --asof
+    # (harness-issued) and the card's own trusted as-of. min() means a card
+    # can never make us read past the harness cutoff nor vice versa.
+    cands: list[str] = []
     if cli_asof and ISO.match(cli_asof):
-        return cli_asof
+        cands.append(cli_asof[:10])
+    for cand in (card.get("forecast", {}).get("asof"),
+                 card.get("provenance", {}).get("data_cutoff"),
+                 spec.get("asof")):
+        v = str(cand)[:10]
+        if cand and ISO.match(v):
+            cands.append(v)
+            break  # first card-level hit only: forecast.asof before data_cutoff
+    if cands:
+        return min(cands)
     idx_p = unit / "text" / "corpus_index.json"
     if idx_p.exists():
         try:
@@ -149,12 +162,6 @@ def _resolve_asof(unit: pathlib.Path, card: dict, spec: dict,
                 return v
         except Exception:
             pass
-    for cand in (card.get("forecast", {}).get("asof"),
-                 card.get("provenance", {}).get("data_cutoff"),
-                 spec.get("asof")):
-        v = str(cand)[:10]
-        if cand and ISO.match(v):
-            return v
     raise ValueError(f"cannot resolve as-of date for {unit.name}")
 
 
